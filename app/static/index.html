@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>D3.js Disease Graph (Anchored + Bounded)</title>
+    <!-- Include D3.js from a CDN -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+      body {
+        font-family: sans-serif;
+        background-color: #f9f9f9; /* Light theme background */
+        margin: 0;
+        padding: 0;
+      }
+      #status {
+        padding: 10px;
+        font-weight: bold;
+      }
+      #graph-container {
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+        position: relative;
+      }
+      .legend {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        padding: 8px;
+        background: #fff;
+        border: 1px solid #ccc;
+      }
+      .legend-item {
+        display: flex;
+        align-items: center;
+        margin-bottom: 4px;
+      }
+      .legend-color-box {
+        width: 12px;
+        height: 12px;
+        margin-right: 6px;
+      }
+      .node circle {
+        stroke: #fff;
+        stroke-width: 1px;
+        cursor: pointer;
+      }
+      .node text {
+        pointer-events: none;
+        font-size: 12px;
+      }
+      line.link {
+        stroke: #999;
+        stroke-opacity: 0.6;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">Connecting to WebSocket...</div>
+    <div id="graph-container"></div>
+
+    <script>
+      let ws = new WebSocket("ws://localhost:8000/ws");
+
+      ws.onopen = function (event) {
+        document.getElementById("status").textContent = "Connected to /ws!";
+      };
+
+      ws.onmessage = function (event) {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.event === "all_recommendations") {
+            const recommendations = msg.data;
+            const mappings = msg.mappings;
+            buildGraph(recommendations, mappings);
+          } else {
+            console.log("Received another message:", msg);
+          }
+        } catch (err) {
+          console.log("Received text message:", event.data);
+        }
+      };
+
+      ws.onclose = function (event) {
+        document.getElementById("status").textContent =
+          "WebSocket disconnected.";
+      };
+
+      ws.onerror = function (event) {
+        document.getElementById("status").textContent = "WebSocket error!";
+      };
+
+      function buildGraph(recommendations, mappings) {
+        const container = document.getElementById("graph-container");
+        container.innerHTML = ""; // Clear any existing content
+
+        let nodes = [];
+        let nodeLookup = {};
+
+        // Build node array
+        for (let key of Object.keys(recommendations)) {
+          let sourceObj = recommendations[key].source;
+          let dfamilyCode = sourceObj.disease_family;
+          let diseaseCode = sourceObj.disease;
+          let diseaseName = mappings.disease[diseaseCode];
+          let diseaseFamilyName = mappings.disease_family[dfamilyCode];
+
+          let node = {
+            id: key, // unique ID for D3
+            patient_id: sourceObj.patient_id,
+            diseaseFamily: dfamilyCode,
+            disease: diseaseCode,
+            diseaseName: diseaseName,
+            diseaseFamilyName: diseaseFamilyName,
+          };
+          nodes.push(node);
+
+          // Build lookup
+          let lookupKey = `${sourceObj.patient_id}-${dfamilyCode}-${diseaseCode}`;
+          nodeLookup[lookupKey] = key;
+        }
+
+        // Build links from recommendations
+        let links = [];
+        for (let key of Object.keys(recommendations)) {
+          let recs = recommendations[key].recommendations;
+          for (let recObj of recs) {
+            let recLookupKey = `${recObj.patient_id}-${recObj.disease_family}-${recObj.disease}`;
+            if (nodeLookup[recLookupKey] !== undefined) {
+              links.push({
+                source: key,
+                target: nodeLookup[recLookupKey],
+              });
+            }
+          }
+        }
+
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+
+        let svg = d3
+          .select(container)
+          .append("svg")
+          .attr("width", width)
+          .attr("height", height);
+
+        // Color scale by diseaseFamilyName
+        let uniqueFamilies = [
+          ...new Set(nodes.map((d) => d.diseaseFamilyName)),
+        ];
+        let colorScale = d3
+          .scaleOrdinal(d3.schemeCategory10)
+          .domain(uniqueFamilies);
+
+        // Force simulation, anchored at center, with bounding
+        let simulation = d3
+          .forceSimulation(nodes)
+          .force(
+            "link",
+            d3
+              .forceLink(links)
+              .id((d) => d.id)
+              .distance(120)
+          ) // Slightly increase or decrease as needed
+          .force("charge", d3.forceManyBody().strength(-40)) // Less negative than -120 => less repulsion
+          .force(
+            "collide",
+            d3
+              .forceCollide()
+              .radius(50) // Node radius + some padding
+              .strength(0.5)
+          ) // Tweak collision strength
+          .force("center", d3.forceCenter(width / 2, height / 2));
+
+        let link = svg
+          .append("g")
+          .attr("class", "links")
+          .selectAll("line.link")
+          .data(links)
+          .enter()
+          .append("line")
+          .attr("class", "link")
+          .style("stroke-width", 1);
+
+        let nodeGroup = svg
+          .selectAll(".node")
+          .data(nodes)
+          .enter()
+          .append("g")
+          .attr("class", "node")
+          .call(
+            d3
+              .drag()
+              .on("start", dragstarted)
+              .on("drag", dragged)
+              .on("end", dragended)
+          );
+
+        let radius = 12; // node circle radius
+
+        nodeGroup
+          .append("circle")
+          .attr("r", radius)
+          .attr("fill", (d) => colorScale(d.diseaseFamilyName));
+
+        nodeGroup
+          .append("text")
+          .attr("dx", radius + 2)
+          .attr("dy", "0.35em")
+          .text((d) => d.diseaseName);
+
+        simulation.on("tick", () => {
+          // Keep nodes within viewport in the tick function
+          nodeGroup.attr("transform", (d) => {
+            // clamp x, y to stay within [radius..(width-radius)] and [radius..(height-radius)]
+            d.x = Math.max(radius, Math.min(width - radius, d.x));
+            d.y = Math.max(radius, Math.min(height - radius, d.y));
+            return `translate(${d.x},${d.y})`;
+          });
+
+          link
+            .attr("x1", (d) => d.source.x)
+            .attr("y1", (d) => d.source.y)
+            .attr("x2", (d) => d.target.x)
+            .attr("y2", (d) => d.target.y);
+        });
+
+        // Legend
+        let legend = d3.select(container).append("div").attr("class", "legend");
+
+        uniqueFamilies.forEach((fam) => {
+          let item = legend.append("div").attr("class", "legend-item");
+          item
+            .append("div")
+            .attr("class", "legend-color-box")
+            .style("background-color", colorScale(fam));
+          item.append("span").text(fam);
+        });
+
+        // Drag event handlers
+        function dragstarted(event, d) {
+          if (!event.active) simulation.alphaTarget(0.3).restart();
+          d.fx = d.x;
+          d.fy = d.y;
+        }
+        function dragged(event, d) {
+          d.fx = event.x;
+          d.fy = event.y;
+        }
+        function dragended(event, d) {
+          if (!event.active) simulation.alphaTarget(0);
+          d.fx = null;
+          d.fy = null;
+        }
+      }
+    </script>
+  </body>
+</html>
